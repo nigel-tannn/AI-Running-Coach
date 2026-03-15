@@ -91,19 +91,17 @@ def get_user_profile(user_id):
         c.execute("SELECT goal, race_date, available_days FROM user_profile WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         if not row:
-            # Create default profile for new users
-            default_date = (datetime.now(timezone(timedelta(hours=8))) + timedelta(weeks=12)).strftime("%Y-%m-%d")
-            default_days = json.dumps(["Monday", "Tuesday", "Thursday", "Saturday"])
+            # Create completely empty default profile for new users
             c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (?, ?, ?, ?)",
-                      (user_id, "Run a Sub-50 minute 10k", default_date, default_days))
+                      (user_id, "", "", "[]"))
             conn.commit()
-            return ("Run a Sub-50 minute 10k", default_date, default_days)
+            return ("", "", "[]")
         return row
 
 def update_user_profile(user_id, goal, race_date, available_days):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        date_str = race_date.strftime("%Y-%m-%d") if hasattr(race_date, 'strftime') else str(race_date)
+        date_str = race_date.strftime("%Y-%m-%d") if race_date else ""
         days_str = json.dumps(available_days)
         
         c.execute("SELECT id FROM user_profile WHERE user_id = ?", (user_id,))
@@ -313,21 +311,29 @@ def generate_broad_plan_ai(user_goal, race_date, weeks_to_race, available_days, 
     
     history_str = run_history_df.to_string(index=False) if not run_history_df.empty else "No previous data."
     avail_days_str = ", ".join(available_days) if available_days else "None"
+    goal_str = user_goal if user_goal else "Improve overall fitness"
+    
+    if race_date:
+        race_info = f"- Race Date: {race_date} ({weeks_to_race:.1f} weeks away)"
+        task_instruction = f"1. Break the remaining {weeks_to_race:.1f} weeks down into distinct training blocks (e.g., Base, Build, Peak, Taper)."
+    else:
+        race_info = "- Race Date: Not set"
+        task_instruction = "1. Break the next 12 weeks down into distinct training blocks based on general fitness progression."
     
     prompt = f"""
     You are an elite endurance running coach.
     
     User Profile:
-    - Goal: "{user_goal}"
-    - Race Date: {race_date} ({weeks_to_race:.1f} weeks away)
+    - Goal: "{goal_str}"
+    {race_info}
     - Available Running Days: {avail_days_str}
     
     Recent History (for fitness baseline):
     {history_str}
     
     Task:
-    Provide a comprehensive, high-level Macrocycle Training Plan leading up to the race.
-    1. Break the remaining {weeks_to_race:.1f} weeks down into distinct training blocks (e.g., Base, Build, Peak, Taper).
+    Provide a comprehensive, high-level Macrocycle Training Plan.
+    {task_instruction}
     2. For each block, specify the primary focus, target weekly mileage (ramping up safely), and key workout types.
     3. Ensure the principles of progressive overload are applied safely (no more than 10-15% weekly volume increase) to avoid overtraining.
     4. Respond in beautifully formatted Markdown with headers, bullet points, and clear distinctions between phases. Do not output JSON.
@@ -376,9 +382,15 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     avail_days_str = ", ".join(available_days) if available_days else "None"
     rest_days_str = ", ".join(rest_days) if rest_days else "None"
     
+    goal_str = user_goal if user_goal else "Improve overall fitness"
+    if "No race date set" in current_phase:
+        phase_str = f"Their current training phase is: **{current_phase}**."
+    else:
+        phase_str = f"They are currently {weeks_to_race:.1f} weeks away from their race day, putting them in the **{current_phase}**."
+    
     prompt = f"""
-    You are an elite endurance running coach. The user's ultimate goal is: "{user_goal}".
-    They are currently {weeks_to_race:.1f} weeks away from their race day, putting them in the **{current_phase}**.
+    You are an elite endurance running coach. The user's ultimate goal is: "{goal_str}".
+    {phase_str}
     
     Here is their recent running history (last 10 runs):
     {history_str}
@@ -400,7 +412,7 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
       1. Available running days: {avail_days_str}. You MUST assign "Rest" (0 km) on {rest_days_str}.
       2. WORKOUT SEQUENCE: The ideal weekly sequence of active runs is: Easy Run -> Interval -> Tempo -> Long Run.
          The user's most recent run was: **{latest_run_type}**. Sequence the NEXT active day based on this cycle.
-      3. PROGRESSIVE OVERLOAD & OVERTRAINING PREVENTION: Look at their recent historical distances. Do NOT increase total weekly mileage by more than 10-15%. Prioritize recovery if their HR data indicates fatigue. Scale the intensity to match their current macrocycle phase ({current_phase}).
+      3. PROGRESSIVE OVERLOAD & OVERTRAINING PREVENTION: Look at their recent historical distances. Do NOT increase total weekly mileage by more than 10-15%. Prioritize recovery if their HR data indicates fatigue. Scale the intensity appropriately.
       4. EXTREMELY DETAILED GUIDANCE: For active runs, provide highly detailed Markdown guidance (`workout_details`). Must include headers for: Goal, Warm-up, Main Set (reps, exact segment pace targets), Cool-down, and Execution Cues.
     
     Respond ONLY with a valid JSON object matching this exact schema:
@@ -520,11 +532,11 @@ st.caption(f"🕒 **Current Time:** {sgt_time_str} | 👤 **Logged in as:** {st.
 # --- Sidebar & Persistent Profile Logic ---
 profile_data = get_user_profile(USER_ID)
 db_goal, db_race_date_str, db_avail_days_str = profile_data
-db_race_date = datetime.strptime(db_race_date_str, "%Y-%m-%d").date()
-db_avail_days = json.loads(db_avail_days_str)
+db_race_date = datetime.strptime(db_race_date_str, "%Y-%m-%d").date() if db_race_date_str else None
+db_avail_days = json.loads(db_avail_days_str) if db_avail_days_str else []
 
 st.sidebar.header("🎯 Goal & Timeline")
-user_goal = st.sidebar.text_area("What is your running goal?", value=db_goal)
+user_goal = st.sidebar.text_area("What is your running goal?", value=db_goal, placeholder="e.g. Run a Sub-50 min 10k")
 race_date = st.sidebar.date_input("Race Date", value=db_race_date)
 
 st.sidebar.subheader("🗓️ Availability")
@@ -534,6 +546,10 @@ available_days = st.sidebar.multiselect(
     default=db_avail_days
 )
 
+if not user_goal:
+    st.sidebar.warning("Please set a running goal.")
+if not race_date:
+    st.sidebar.warning("Please set a target race date.")
 if not available_days:
     st.sidebar.warning("Please select at least one available running day.")
 
@@ -542,17 +558,21 @@ if user_goal != db_goal or race_date != db_race_date or available_days != db_ava
     update_user_profile(USER_ID, user_goal, race_date, available_days)
 
 # Calculate Training Phase based on weeks to race
-weeks_to_race = (race_date - sgt_now.date()).days / 7
-if weeks_to_race > 8:
-    current_phase = "Base Phase (Building aerobic capacity & mileage)"
-elif weeks_to_race > 4:
-    current_phase = "Build Phase (Increasing intensity & race-specific pace)"
-elif weeks_to_race > 2:
-    current_phase = "Peak Phase (Maximum race-specific fitness)"
-elif weeks_to_race >= 0:
-    current_phase = "Taper Phase (Reducing fatigue, maintaining sharpness)"
+if race_date:
+    weeks_to_race = (race_date - sgt_now.date()).days / 7
+    if weeks_to_race > 8:
+        current_phase = "Base Phase (Building aerobic capacity & mileage)"
+    elif weeks_to_race > 4:
+        current_phase = "Build Phase (Increasing intensity & race-specific pace)"
+    elif weeks_to_race > 2:
+        current_phase = "Peak Phase (Maximum race-specific fitness)"
+    elif weeks_to_race >= 0:
+        current_phase = "Taper Phase (Reducing fatigue, maintaining sharpness)"
+    else:
+        current_phase = "Recovery/Post-Race"
 else:
-    current_phase = "Recovery/Post-Race"
+    weeks_to_race = 0.0
+    current_phase = "General Training (No race date set)"
 
 # --- Tabs ---
 # Determine if the user is the superuser (Nigel)
@@ -730,7 +750,10 @@ with tab2:
 with tab3:
     st.header("🗺️ Broad Training Plan (Macrocycle)")
     
-    st.write(f"**Target Race Date:** {race_date.strftime('%A, %B %d, %Y')} ({weeks_to_race:.1f} weeks away)")
+    if race_date:
+        st.write(f"**Target Race Date:** {race_date.strftime('%A, %B %d, %Y')} ({weeks_to_race:.1f} weeks away)")
+    else:
+        st.write("**Target Race Date:** Not set")
     st.info(f"📍 **Current Stage:** {current_phase}")
     
     st.write("Generate a week-by-week overview of your entire training block leading up to race day to understand how your mileage and intensity will gradually ramp up safely.")
