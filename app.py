@@ -23,7 +23,7 @@ except (KeyError, FileNotFoundError):
 # ----------------------------
 
 def init_db():
-    """Initialize the SQLite database for storing run history, macro plans, and micro plans."""
+    """Initialize the SQLite database for storing run history, macro plans, micro plans, and user profile."""
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS runs
@@ -53,9 +53,38 @@ def init_db():
         # Table for storing the 7-Day Training Plan (Microcycle)
         c.execute('''CREATE TABLE IF NOT EXISTS micro_plan
                      (id INTEGER PRIMARY KEY, plan_json TEXT)''')
+                     
+        # Table for storing User Profile Settings to prevent resetting on redeploy
+        c.execute('''CREATE TABLE IF NOT EXISTS user_profile
+                     (id INTEGER PRIMARY KEY, goal TEXT, race_date TEXT, available_days TEXT)''')
+        
+        # Initialize default profile if none exists
+        c.execute("SELECT COUNT(*) FROM user_profile")
+        if c.fetchone()[0] == 0:
+            default_date = (datetime.now(timezone(timedelta(hours=8))) + timedelta(weeks=12)).strftime("%Y-%m-%d")
+            default_days = json.dumps(["Monday", "Tuesday", "Thursday", "Saturday"])
+            c.execute("INSERT INTO user_profile (id, goal, race_date, available_days) VALUES (1, ?, ?, ?)",
+                      ("Run a Sub-50 minute 10k", default_date, default_days))
             
         conn.commit()
 
+# --- Profile Database Functions ---
+def get_user_profile():
+    with sqlite3.connect('coach.db') as conn:
+        c = conn.cursor()
+        c.execute("SELECT goal, race_date, available_days FROM user_profile WHERE id = 1")
+        return c.fetchone()
+
+def update_user_profile(goal, race_date, available_days):
+    with sqlite3.connect('coach.db') as conn:
+        c = conn.cursor()
+        date_str = race_date.strftime("%Y-%m-%d") if hasattr(race_date, 'strftime') else str(race_date)
+        days_str = json.dumps(available_days)
+        c.execute("UPDATE user_profile SET goal = ?, race_date = ?, available_days = ? WHERE id = 1",
+                  (goal, date_str, days_str))
+        conn.commit()
+
+# --- Run History Database Functions ---
 def run_exists(date):
     """Check if a run with the exact date (down to the minute) already exists."""
     with sqlite3.connect('coach.db') as conn:
@@ -102,6 +131,7 @@ def delete_run(run_id):
         c.execute("DELETE FROM runs WHERE id = ?", (int(run_id),))
         conn.commit()
 
+# --- Plan Database Functions ---
 def get_macro_plan():
     """Retrieve the saved Broad Training Plan."""
     with sqlite3.connect('coach.db') as conn:
@@ -454,22 +484,30 @@ sgt_now = datetime.now(timezone(timedelta(hours=8)))
 sgt_time_str = sgt_now.strftime("%A, %B %d, %Y - %I:%M %p (SGT)")
 st.caption(f"🕒 **Current Time:** {sgt_time_str}")
 
-# --- Sidebar ---
-st.sidebar.header("🎯 Goal & Timeline")
-user_goal = st.sidebar.text_area("What is your running goal?", "Run a Sub-50 minute 10k")
+# --- Sidebar & Persistent Profile Logic ---
+# Fetch user profile settings from DB
+profile_data = get_user_profile()
+db_goal, db_race_date_str, db_avail_days_str = profile_data
+db_race_date = datetime.strptime(db_race_date_str, "%Y-%m-%d").date()
+db_avail_days = json.loads(db_avail_days_str)
 
-default_race_date = (sgt_now + timedelta(weeks=12)).date()
-race_date = st.sidebar.date_input("Race Date", value=default_race_date)
+st.sidebar.header("🎯 Goal & Timeline")
+user_goal = st.sidebar.text_area("What is your running goal?", value=db_goal)
+race_date = st.sidebar.date_input("Race Date", value=db_race_date)
 
 st.sidebar.subheader("🗓️ Availability")
 available_days = st.sidebar.multiselect(
     "Select your available running days:",
     ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
-    default=["Monday", "Tuesday", "Thursday", "Saturday"]
+    default=db_avail_days
 )
 
 if not available_days:
     st.sidebar.warning("Please select at least one available running day.")
+
+# Auto-save changes to the profile
+if user_goal != db_goal or race_date != db_race_date or available_days != db_avail_days:
+    update_user_profile(user_goal, race_date, available_days)
 
 # Calculate Training Phase based on weeks to race
 weeks_to_race = (race_date - sgt_now.date()).days / 7
