@@ -8,158 +8,187 @@ from datetime import datetime, timezone, timedelta
 import os
 import altair as alt
 from PIL import Image
+import hashlib
 
 # ----------------------------
 # Configure Gemini API
 # ----------------------------
-# Securely fetch API key from Streamlit secrets, fallback to environment variables
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except (KeyError, FileNotFoundError):
     API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # ----------------------------
-# Database Setup (SQLite)
+# Authentication Helpers
+# ----------------------------
+def hash_password(password):
+    """Hash a password for storing."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_user(username, password):
+    """Verify a user's login credentials."""
+    with sqlite3.connect('coach.db') as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, password FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        if row and row[1] == hash_password(password):
+            return row[0] # Return user_id
+        return None
+
+def create_user(username, password):
+    """Create a new user account."""
+    with sqlite3.connect('coach.db') as conn:
+        c = conn.cursor()
+        try:
+            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hash_password(password)))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False # Username already exists
+
+# ----------------------------
+# Database Setup
 # ----------------------------
 
 def init_db():
-    """Initialize the SQLite database for storing run history, macro plans, micro plans, and user profile."""
+    """Initialize the SQLite database for the multi-tenant app."""
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
+        
+        # 1. Create Users Table
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                      username TEXT UNIQUE, 
+                      password TEXT)''')
+                      
+        # Ensure Default User (Nigel) exists
+        c.execute("SELECT id FROM users WHERE username = 'Nigel'")
+        if not c.fetchone():
+            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", ("Nigel", hash_password("nigel123")))
+
+        # 2. Initialize Data Tables with user_id
         c.execute('''CREATE TABLE IF NOT EXISTS runs
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                      date TEXT, 
-                      distance REAL, 
-                      duration REAL, 
-                      avg_hr REAL, 
-                      pace REAL,
-                      run_type TEXT)''')
-        
-        # Backward compatibility for existing runs table
-        try:
-            c.execute("ALTER TABLE runs ADD COLUMN run_type TEXT DEFAULT 'Easy'")
-        except sqlite3.OperationalError:
-            pass 
-            
-        try:
-            c.execute("ALTER TABLE runs ADD COLUMN insight TEXT DEFAULT 'No detailed insight generated.'")
-        except sqlite3.OperationalError:
-            pass
-            
-        # Table for storing the Broad Training Plan (Macrocycle)
+                      user_id INTEGER,
+                      date TEXT, distance REAL, duration REAL, 
+                      avg_hr REAL, pace REAL, run_type TEXT, insight TEXT)''')
+                      
         c.execute('''CREATE TABLE IF NOT EXISTS macro_plan
-                     (id INTEGER PRIMARY KEY, plan_text TEXT)''')
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_text TEXT)''')
                      
-        # Table for storing the 7-Day Training Plan (Microcycle)
         c.execute('''CREATE TABLE IF NOT EXISTS micro_plan
-                     (id INTEGER PRIMARY KEY, plan_json TEXT)''')
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_json TEXT)''')
                      
-        # Table for storing User Profile Settings to prevent resetting on redeploy
         c.execute('''CREATE TABLE IF NOT EXISTS user_profile
-                     (id INTEGER PRIMARY KEY, goal TEXT, race_date TEXT, available_days TEXT)''')
-        
-        # Initialize default profile if none exists
-        c.execute("SELECT COUNT(*) FROM user_profile")
-        if c.fetchone()[0] == 0:
-            default_date = (datetime.now(timezone(timedelta(hours=8))) + timedelta(weeks=12)).strftime("%Y-%m-%d")
-            default_days = json.dumps(["Monday", "Tuesday", "Thursday", "Saturday"])
-            c.execute("INSERT INTO user_profile (id, goal, race_date, available_days) VALUES (1, ?, ?, ?)",
-                      ("Run a Sub-50 minute 10k", default_date, default_days))
-            
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, goal TEXT, race_date TEXT, available_days TEXT)''')
+
         conn.commit()
 
 # --- Profile Database Functions ---
-def get_user_profile():
+def get_user_profile(user_id):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("SELECT goal, race_date, available_days FROM user_profile WHERE id = 1")
-        return c.fetchone()
+        c.execute("SELECT goal, race_date, available_days FROM user_profile WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row:
+            # Create default profile for new users
+            default_date = (datetime.now(timezone(timedelta(hours=8))) + timedelta(weeks=12)).strftime("%Y-%m-%d")
+            default_days = json.dumps(["Monday", "Tuesday", "Thursday", "Saturday"])
+            c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (?, ?, ?, ?)",
+                      (user_id, "Run a Sub-50 minute 10k", default_date, default_days))
+            conn.commit()
+            return ("Run a Sub-50 minute 10k", default_date, default_days)
+        return row
 
-def update_user_profile(goal, race_date, available_days):
+def update_user_profile(user_id, goal, race_date, available_days):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
         date_str = race_date.strftime("%Y-%m-%d") if hasattr(race_date, 'strftime') else str(race_date)
         days_str = json.dumps(available_days)
-        c.execute("UPDATE user_profile SET goal = ?, race_date = ?, available_days = ? WHERE id = 1",
-                  (goal, date_str, days_str))
+        
+        c.execute("SELECT id FROM user_profile WHERE user_id = ?", (user_id,))
+        if c.fetchone():
+            c.execute("UPDATE user_profile SET goal = ?, race_date = ?, available_days = ? WHERE user_id = ?",
+                      (goal, date_str, days_str, user_id))
+        else:
+            c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (?, ?, ?, ?)",
+                      (user_id, goal, date_str, days_str))
         conn.commit()
 
 # --- Run History Database Functions ---
-def run_exists(date):
-    """Check if a run with the exact date (down to the minute) already exists."""
+def run_exists(user_id, date):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("SELECT id FROM runs WHERE date = ?", (date,))
+        c.execute("SELECT id FROM runs WHERE user_id = ? AND date = ?", (user_id, date))
         return c.fetchone() is not None
 
-def save_run(date, distance, duration, avg_hr, pace, run_type):
-    """Save a new run into the database and return its ID."""
+def save_run(user_id, date, distance, duration, avg_hr, pace, run_type):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO runs (date, distance, duration, avg_hr, pace, run_type) VALUES (?, ?, ?, ?, ?, ?)",
-                  (date, distance, duration, avg_hr, pace, run_type))
+        c.execute("INSERT INTO runs (user_id, date, distance, duration, avg_hr, pace, run_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (user_id, date, distance, duration, avg_hr, pace, run_type))
         conn.commit()
         return c.lastrowid
 
-def update_run_insight(run_id, insight_text):
-    """Update a specific run with qualitative AI insights."""
+def update_run_insight(user_id, run_id, insight_text):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("UPDATE runs SET insight = ? WHERE id = ?", (insight_text, int(run_id)))
+        c.execute("UPDATE runs SET insight = ? WHERE id = ? AND user_id = ?", (insight_text, int(run_id), user_id))
         conn.commit()
 
-def update_run_type(run_id, new_run_type):
-    """Update the run type of a specific run."""
+def update_run_type(user_id, run_id, new_run_type):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("UPDATE runs SET run_type = ? WHERE id = ?", (new_run_type, int(run_id)))
+        c.execute("UPDATE runs SET run_type = ? WHERE id = ? AND user_id = ?", (new_run_type, int(run_id), user_id))
         conn.commit()
 
-def get_run_history(limit=None):
-    """Retrieve the most recent runs from the database."""
+def get_run_history(user_id, limit=None):
     with sqlite3.connect('coach.db') as conn:
+        query = f"SELECT id, date, distance, duration, avg_hr, pace, run_type, insight FROM runs WHERE user_id = {user_id} ORDER BY date DESC"
         if limit:
-            df = pd.read_sql_query(f"SELECT id, date, distance, duration, avg_hr, pace, run_type, insight FROM runs ORDER BY date DESC LIMIT {limit}", conn)
-        else:
-            df = pd.read_sql_query("SELECT id, date, distance, duration, avg_hr, pace, run_type, insight FROM runs ORDER BY date DESC", conn)
+            query += f" LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
     return df
 
-def delete_run(run_id):
-    """Delete a specific run from the database using its ID."""
+def delete_run(user_id, run_id):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM runs WHERE id = ?", (int(run_id),))
+        c.execute("DELETE FROM runs WHERE id = ? AND user_id = ?", (int(run_id), user_id))
         conn.commit()
 
 # --- Plan Database Functions ---
-def get_macro_plan():
-    """Retrieve the saved Broad Training Plan."""
+def get_macro_plan(user_id):
     with sqlite3.connect('coach.db') as conn:
-        df = pd.read_sql_query("SELECT plan_text FROM macro_plan WHERE id = 1", conn)
+        df = pd.read_sql_query(f"SELECT plan_text FROM macro_plan WHERE user_id = {user_id}", conn)
         if not df.empty:
             return df['plan_text'].iloc[0]
         return None
 
-def save_macro_plan(plan_text):
-    """Save or update the Broad Training Plan."""
+def save_macro_plan(user_id, plan_text):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO macro_plan (id, plan_text) VALUES (1, ?)", (plan_text,))
+        c.execute("SELECT id FROM macro_plan WHERE user_id = ?", (user_id,))
+        if c.fetchone():
+            c.execute("UPDATE macro_plan SET plan_text = ? WHERE user_id = ?", (plan_text, user_id))
+        else:
+            c.execute("INSERT INTO macro_plan (user_id, plan_text) VALUES (?, ?)", (user_id, plan_text))
         conn.commit()
         
-def get_micro_plan():
-    """Retrieve the saved 7-Day Training Plan from the DB."""
+def get_micro_plan(user_id):
     with sqlite3.connect('coach.db') as conn:
-        df = pd.read_sql_query("SELECT plan_json FROM micro_plan WHERE id = 1", conn)
+        df = pd.read_sql_query(f"SELECT plan_json FROM micro_plan WHERE user_id = {user_id}", conn)
         if not df.empty:
             return json.loads(df['plan_json'].iloc[0])
         return None
 
-def save_micro_plan(plan_data):
-    """Save the 7-Day Training Plan to the DB to prevent re-fetching on reload."""
+def save_micro_plan(user_id, plan_data):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO micro_plan (id, plan_json) VALUES (1, ?)", (json.dumps(plan_data),))
+        c.execute("SELECT id FROM micro_plan WHERE user_id = ?", (user_id,))
+        if c.fetchone():
+            c.execute("UPDATE micro_plan SET plan_json = ? WHERE user_id = ?", (json.dumps(plan_data), user_id))
+        else:
+            c.execute("INSERT INTO micro_plan (user_id, plan_json) VALUES (?, ?)", (user_id, json.dumps(plan_data)))
         conn.commit()
 
 # ----------------------------
@@ -167,7 +196,6 @@ def save_micro_plan(plan_data):
 # ----------------------------
 
 def format_pace(decimal_pace):
-    """Convert decimal pace (e.g., 5.5) to string format (e.g., '5:30')."""
     if pd.isna(decimal_pace):
         return "0:00"
     minutes = int(decimal_pace)
@@ -175,7 +203,6 @@ def format_pace(decimal_pace):
     return f"{minutes}:{seconds:02d}"
 
 def format_duration(minutes):
-    """Convert decimal minutes to h/min format (e.g., '1h 5m' or '45m')."""
     if pd.isna(minutes):
         return "0m"
     h = int(minutes // 60)
@@ -190,7 +217,6 @@ def format_duration(minutes):
 # ----------------------------
 
 def parse_tcx(file):
-    """Parse Garmin TCX file and return a Trackpoints DataFrame and a Laps DataFrame."""
     tree = ET.parse(file)
     root = tree.getroot()
     ns = {'ns': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'}
@@ -239,15 +265,9 @@ def parse_tcx(file):
     laps_df = pd.DataFrame(laps_data)
     return df, laps_df
 
-# ----------------------------
-# Compute Run Metrics
-# ----------------------------
-
 def compute_metrics(df):
-    """Calculate total distance, duration (fixed), HR, and pace."""
     if df.empty:
         return None
-        
     distance = df["distance_km"].max()
     duration_secs = (df["time"].iloc[-1] - df["time"].iloc[0]).total_seconds()
     duration_mins = duration_secs / 60
@@ -265,7 +285,6 @@ def compute_metrics(df):
     }
 
 def generate_detailed_context(metrics, laps_df, run_type):
-    """Generate a text string for the AI prompt based on the run type and lap data."""
     context = f"Run Type Categorization: {run_type}\n"
     context += f"Overall Distance: {metrics['distance']} km\n"
     context += f"Overall Duration: {metrics['duration']} min\n"
@@ -282,7 +301,6 @@ def generate_detailed_context(metrics, laps_df, run_type):
             pace_str = format_pace(row['pace'])
             hr_str = f"{int(row['avg_hr'])} bpm" if row['avg_hr'] > 0 else "N/A"
             context += f"- Lap {int(row['lap'])}: {row['distance']:.2f}km in {row['duration']:.2f}m (Pace: {pace_str}), Avg HR: {hr_str}\n"
-            
     return context
 
 # ----------------------------
@@ -290,7 +308,6 @@ def generate_detailed_context(metrics, laps_df, run_type):
 # ----------------------------
 
 def generate_broad_plan_ai(user_goal, race_date, weeks_to_race, available_days, run_history_df):
-    """Generate a broad macrocycle training plan using Gemini."""
     genai.configure(api_key=API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
     
@@ -315,12 +332,10 @@ def generate_broad_plan_ai(user_goal, race_date, weeks_to_race, available_days, 
     3. Ensure the principles of progressive overload are applied safely (no more than 10-15% weekly volume increase) to avoid overtraining.
     4. Respond in beautifully formatted Markdown with headers, bullet points, and clear distinctions between phases. Do not output JSON.
     """
-    
     response = model.generate_content(prompt)
     return response.text
 
 def generate_historical_insight(detailed_run_context, uploaded_images, run_date):
-    """Generate qualitative insight for a historical run using Gemini."""
     genai.configure(api_key=API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
     
@@ -333,21 +348,17 @@ def generate_historical_insight(detailed_run_context, uploaded_images, run_date)
     Heavily incorporate the provided screenshots (e.g., lap paces, HR graphs) to extract deeper insights.
     Respond ONLY with the qualitative analysis text. Do not use JSON.
     """
-    
     contents = [prompt]
     if uploaded_images:
         for img_file in uploaded_images:
             try:
                 img = Image.open(img_file)
                 contents.append(img)
-            except Exception:
-                pass
-                
+            except Exception: pass
     response = model.generate_content(contents)
     return response.text
 
 def update_training_plan(detailed_run_context, run_history_df, user_goal, available_days, current_phase, weeks_to_race, uploaded_images=None, screenshot_run_date=None, latest_run_type="Easy"):
-    """Send history, context, and macrocycle data to Gemini to get a structured microcycle (7-day plan)."""
     genai.configure(api_key=API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
     
@@ -408,62 +419,39 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     """
     
     contents = [prompt]
-    
     if uploaded_images:
         for img_file in uploaded_images:
             try:
                 img = Image.open(img_file)
                 contents.append(img)
-            except Exception:
-                pass 
+            except Exception: pass 
 
     response = model.generate_content(
         contents,
         generation_config={"response_mime_type": "application/json"}
     )
-    
     return json.loads(response.text)
 
+
 # ----------------------------
-# Streamlit UI
+# Streamlit UI & Core Logic
 # ----------------------------
 
 st.set_page_config(page_title="AI Running Coach", page_icon="🏃‍♂️", layout="wide")
 
-# Inject Custom CSS for Aesthetics
+# Inject Custom CSS
 st.markdown("""
 <style>
-    /* Main Fonts */
     .stApp { font-family: 'Inter', sans-serif; }
     h1, h2, h3 { font-weight: 700 !important; }
-    
-    /* Custom Insight Box */
     .insight-box {
-        background: #f8fafc;
-        padding: 24px;
-        border-radius: 12px;
-        border-left: 8px solid #3b82f6;
-        margin-bottom: 24px;
-        color: #0f172a !important; /* Force dark text on the light background */
-        font-size: 1.1rem;
-        line-height: 1.6;
+        background: #f8fafc; padding: 24px; border-radius: 12px;
+        border-left: 8px solid #3b82f6; margin-bottom: 24px;
+        color: #0f172a !important; font-size: 1.1rem; line-height: 1.6;
     }
-    
-    /* Expander Styling (Theme Aware) */
-    .streamlit-expanderHeader {
-        font-weight: 600 !important;
-        font-size: 1.1rem !important;
-    }
-    div[data-testid="stExpander"] {
-        border: 1px solid rgba(150, 150, 150, 0.2);
-        border-radius: 10px;
-        margin-bottom: 12px;
-    }
-    
-    /* Metrics Customization */
+    .streamlit-expanderHeader { font-weight: 600 !important; font-size: 1.1rem !important; }
+    div[data-testid="stExpander"] { border: 1px solid rgba(150, 150, 150, 0.2); border-radius: 10px; margin-bottom: 12px; }
     div[data-testid="stMetricValue"] { color: #3b82f6 !important; font-weight: 800; font-size: 2rem;}
-    
-    /* Hide file uploader default text label to make it cleaner */
     .css-9ycgxx { display: none; }
 </style>
 """, unsafe_allow_html=True)
@@ -471,22 +459,66 @@ st.markdown("""
 # Initialize database
 init_db()
 
+# --- AUTHENTICATION LAYER ---
+if 'user_id' not in st.session_state:
+    st.title("🏃‍♂️ AI Dynamic Running Coach")
+    st.write("Welcome! Please log in to access your personal training dashboard.")
+    
+    tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
+    
+    with tab_login:
+        with st.form("login_form"):
+            l_username = st.text_input("Username")
+            l_password = st.text_input("Password", type="password")
+            if st.form_submit_button("Login"):
+                user_id = verify_user(l_username, l_password)
+                if user_id:
+                    st.session_state['user_id'] = user_id
+                    st.session_state['username'] = l_username
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+                    
+    with tab_signup:
+        with st.form("signup_form"):
+            s_username = st.text_input("Choose Username")
+            s_password = st.text_input("Choose Password", type="password")
+            if st.form_submit_button("Create Account"):
+                if s_username and s_password:
+                    if create_user(s_username, s_password):
+                        st.success("Account created successfully! Please log in from the other tab.")
+                    else:
+                        st.error("Username already exists. Please choose a different one.")
+                else:
+                    st.warning("Please fill out both fields.")
+    
+    st.stop() # Halt execution if not logged in
+
+# --- MAIN APP (Authenticated) ---
+USER_ID = st.session_state['user_id']
+
 # Load the stored 7-Day Plan from DB into session state on app start
 if 'current_plan' not in st.session_state:
-    stored_plan = get_micro_plan()
+    stored_plan = get_micro_plan(USER_ID)
     if stored_plan:
         st.session_state['current_plan'] = stored_plan
 
-st.title("🏃‍♂️ AI Dynamic Running Coach")
+col_title, col_logout = st.columns([5, 1])
+with col_title:
+    st.title("🏃‍♂️ AI Dynamic Running Coach")
+with col_logout:
+    st.write("")
+    if st.button("🚪 Logout"):
+        st.session_state.clear()
+        st.rerun()
 
 # Display current SGT time
 sgt_now = datetime.now(timezone(timedelta(hours=8)))
 sgt_time_str = sgt_now.strftime("%A, %B %d, %Y - %I:%M %p (SGT)")
-st.caption(f"🕒 **Current Time:** {sgt_time_str}")
+st.caption(f"🕒 **Current Time:** {sgt_time_str} | 👤 **Logged in as:** {st.session_state['username']}")
 
 # --- Sidebar & Persistent Profile Logic ---
-# Fetch user profile settings from DB
-profile_data = get_user_profile()
+profile_data = get_user_profile(USER_ID)
 db_goal, db_race_date_str, db_avail_days_str = profile_data
 db_race_date = datetime.strptime(db_race_date_str, "%Y-%m-%d").date()
 db_avail_days = json.loads(db_avail_days_str)
@@ -507,7 +539,7 @@ if not available_days:
 
 # Auto-save changes to the profile
 if user_goal != db_goal or race_date != db_race_date or available_days != db_avail_days:
-    update_user_profile(user_goal, race_date, available_days)
+    update_user_profile(USER_ID, user_goal, race_date, available_days)
 
 # Calculate Training Phase based on weeks to race
 weeks_to_race = (race_date - sgt_now.date()).days / 7
@@ -545,12 +577,10 @@ with tab1:
                 if metrics:
                     run_date = metrics['date']
                     
-                    # Check against the database for duplicates
-                    if run_exists(run_date):
+                    if run_exists(USER_ID, run_date):
                         duplicates_db.append(f"{file.name} ({run_date})")
                         continue
                         
-                    # Check for duplicates within the current upload batch
                     if run_date in seen_in_batch:
                         duplicates_batch.append(file.name)
                         continue
@@ -568,9 +598,7 @@ with tab1:
             st.warning(f"⚠️ Skipped {len(duplicates_batch)} identical file(s) uploaded within this batch.")
             
         if all_runs_data:
-            # Sort uploaded runs newest first
             all_runs_data = sorted(all_runs_data, key=lambda x: x['metrics']['date'], reverse=True)
-            
             st.success(f"✅ {len(all_runs_data)} new run(s) parsed successfully!")
             
             st.markdown("### 2️⃣ Review & Categorize")
@@ -608,32 +636,25 @@ with tab1:
                 else:
                     latest_run_id = None
                     
-                    # 1. Save all uploaded runs to SQLite with their assigned Run Type
                     for run in all_runs_data:
                         m = run['metrics']
-                        run_id = save_run(m['date'], m['distance'], m['duration'], m['avg_hr'], m['pace'], run['run_type'])
+                        run_id = save_run(USER_ID, m['date'], m['distance'], m['duration'], m['avg_hr'], m['pace'], run['run_type'])
                         if run == all_runs_data[0]:
                             latest_run_id = run_id
                     
-                    # 2. Fetch History
-                    history_df = get_run_history(limit=15)
-                    
-                    # 3. Identify the latest run for the AI prompt and generate the detailed context
+                    history_df = get_run_history(USER_ID, limit=15)
                     latest_run = all_runs_data[0] 
                     detailed_context = generate_detailed_context(latest_run['metrics'], latest_run['laps_df'], latest_run['run_type'])
                     
-                    # 4. Ask Gemini for new plan + qualitative insight
                     with st.spinner("Coach AI is analyzing your splits and structuring your next block..."):
                         try:
                             coach_response = update_training_plan(detailed_context, history_df, user_goal, available_days, current_phase, weeks_to_race, screenshot_files, target_screenshot_run_date, latest_run['run_type'])
                             
-                            # 5. Save the generated qualitative insight to the DB
                             if latest_run_id and 'qualitative_insight' in coach_response:
-                                update_run_insight(latest_run_id, coach_response['qualitative_insight'])
+                                update_run_insight(USER_ID, latest_run_id, coach_response['qualitative_insight'])
                             
-                            # Save the new 7-Day Plan to Streamlit Session AND Database
                             st.session_state['current_plan'] = coach_response['plan']
-                            save_micro_plan(coach_response['plan'])
+                            save_micro_plan(USER_ID, coach_response['plan'])
                             
                             st.success("Training Plan & Insights Updated! Check the 'My Training Plan' tab.")
                         except Exception as e:
@@ -650,7 +671,7 @@ with tab2:
             if not API_KEY:
                 st.error("API Key is missing!")
             else:
-                history_df = get_run_history(limit=15)
+                history_df = get_run_history(USER_ID, limit=15)
                 if history_df.empty:
                     st.warning("You need to log at least one run in the history before generating a plan.")
                 else:
@@ -668,12 +689,10 @@ with tab2:
                             coach_response = update_training_plan(detailed_context, history_df, user_goal, available_days, current_phase, weeks_to_race, None, None, latest_run_row['run_type'])
                             
                             if 'qualitative_insight' in coach_response:
-                                update_run_insight(latest_run_row['id'], coach_response['qualitative_insight'])
+                                update_run_insight(USER_ID, latest_run_row['id'], coach_response['qualitative_insight'])
                                 
-                            # Save the new 7-Day Plan to Streamlit Session AND Database
                             st.session_state['current_plan'] = coach_response['plan']
-                            save_micro_plan(coach_response['plan'])
-                            
+                            save_micro_plan(USER_ID, coach_response['plan'])
                             st.rerun() 
                         except Exception as e:
                             st.error(f"Error communicating with AI: {e}")
@@ -682,7 +701,6 @@ with tab2:
 
     if 'current_plan' in st.session_state and st.session_state['current_plan']:
         plan = st.session_state['current_plan']
-        
         for day in plan:
             icon = "🏃"
             if "Rest" in day['type']: icon = "🛋️"
@@ -691,12 +709,10 @@ with tab2:
             elif "Long" in day['type']: icon = "🗺️"
             
             display_date = day.get('date', f"Day {day.get('day', '?')}")
-            
             with st.expander(f"{display_date} - {icon} {day['type']} ({day.get('distance_km', 0)} km)"):
                 if day['type'] == 'Rest':
                     st.write(day.get('workout_details', 'Rest and recover. Focus on hydration, adequate sleep, and light mobility if needed.'))
                 else:
-                    # Render the highly detailed, structured Markdown provided by the AI
                     st.markdown(day.get('workout_details', ''))
     else:
         st.warning("Upload a run or click 'Refresh Plan' to generate your dynamic training plan.")
@@ -715,17 +731,16 @@ with tab3:
         else:
             with st.spinner("AI is crafting your long-term periodization strategy..."):
                 try:
-                    history_df = get_run_history(limit=20)
+                    history_df = get_run_history(USER_ID, limit=20)
                     macro_plan_text = generate_broad_plan_ai(user_goal, race_date, weeks_to_race, available_days, history_df)
-                    save_macro_plan(macro_plan_text)
+                    save_macro_plan(USER_ID, macro_plan_text)
                     st.success("Macrocycle Plan Generated!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error generating broad plan: {e}")
                     
     st.divider()
-    
-    saved_macro_plan = get_macro_plan()
+    saved_macro_plan = get_macro_plan(USER_ID)
     if saved_macro_plan:
         st.markdown(saved_macro_plan)
     else:
@@ -733,51 +748,39 @@ with tab3:
 
 with tab4:
     st.header("📊 Run History & Insights")
-    history_df = get_run_history(limit=None)
+    history_df = get_run_history(USER_ID, limit=None)
     
     if not history_df.empty:
-        # --- Insight Section for Most Recent Run ---
         latest_history_run = history_df.iloc[0]
         st.write(f"### **Most Recent Run Insight** ({latest_history_run['date']})")
         
-        # Display Metrics visually pleasingly
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Distance", f"{latest_history_run['distance']} km")
         c2.metric("Duration", format_duration(latest_history_run['duration']))
         c3.metric("Pace", format_pace(latest_history_run['pace']) + " /km")
         c4.metric("Avg HR", f"{latest_history_run['avg_hr']} bpm")
         
-        # Display Qualitative AI Insight
         insight_text = latest_history_run.get('insight', '')
         if not insight_text or str(insight_text).strip() in ['', 'None', 'No detailed insight generated.']:
             insight_text = "🔄 *Click 'Refresh Plan' in the 'My Training Plan' tab to generate a detailed qualitative analysis for your latest run.*"
             
         st.markdown(f'<div class="insight-box"><strong>🧠 Qualitative Analysis:</strong><br><br>{insight_text}</div>', unsafe_allow_html=True)
-        
         st.divider()
 
-        # --- 1. Formatted History Table ---
         st.subheader("📋 All Past Runs")
         display_history_df = history_df.copy()
         
-        # Force conversion to strings to guarantee left-alignment across the entire table
         display_history_df['Distance (km)'] = display_history_df['distance'].apply(lambda x: f"{float(x):.2f}")
         display_history_df['Duration (h/min)'] = display_history_df['duration'].apply(format_duration)
         display_history_df['Pace (min/sec)'] = display_history_df['pace'].apply(format_pace)
         display_history_df['Avg HR'] = display_history_df['avg_hr'].apply(lambda x: f"{float(x):.1f}" if pd.notnull(x) and x > 0 else "N/A")
         
-        display_history_df = display_history_df.rename(columns={
-            'date': 'Date',
-            'run_type': 'Type'
-        })
-        
-        # Select columns to display
+        display_history_df = display_history_df.rename(columns={'date': 'Date', 'run_type': 'Type'})
         display_cols = ['Date', 'Type', 'Distance (km)', 'Pace (min/sec)', 'Duration (h/min)', 'Avg HR']
         st.dataframe(display_history_df[display_cols], width="stretch", hide_index=True)
         
         st.divider()
         
-        # --- 2. Mileage Chart ---
         st.subheader("📊 Historical Mileage")
         period = st.selectbox("Group By:", ["Day", "Week", "Month", "Year"])
         
@@ -803,9 +806,7 @@ with tab4:
         
         st.divider()
         
-        # --- 3. Pace Trend Chart ---
         st.subheader("📈 Pace Trend (Lower is faster)")
-        
         pace_df = history_df[['date', 'pace', 'run_type']].copy()
         pace_df['date'] = pd.to_datetime(pace_df['date'])
         pace_df['formatted_pace'] = pace_df['pace'].apply(format_pace)
@@ -820,7 +821,6 @@ with tab4:
                 alt.Tooltip('formatted_pace:N', title='Pace (min/sec)')
             ]
         ).properties(height=350)
-        
         st.altair_chart(pace_chart, width="stretch")
         
     else:
@@ -829,19 +829,17 @@ with tab4:
 with tab5:
     st.header("⚙️ Manage History")
     
-    history_df = get_run_history(limit=None)
+    history_df = get_run_history(USER_ID, limit=None)
     
     if not history_df.empty:
         st.write("Edit the **Run Type** directly in the table below, or select rows and press **Delete** on your keyboard to remove them. Click **Save Changes** when you are done.")
         
-        # Prepare the dataframe for the editor
         edit_df = history_df[['id', 'date', 'distance', 'run_type', 'pace', 'avg_hr']].copy()
         
-        # Render the interactive data editor
         edited_df = st.data_editor(
             edit_df,
             column_config={
-                "id": None, # Hide ID from UI but keep it in the dataframe for backend logic
+                "id": None, 
                 "date": st.column_config.TextColumn("Date", disabled=True),
                 "distance": st.column_config.NumberColumn("Distance (km)", disabled=True),
                 "run_type": st.column_config.SelectboxColumn(
@@ -854,33 +852,29 @@ with tab5:
             },
             disabled=["date", "distance", "pace", "avg_hr"],
             hide_index=True,
-            num_rows="dynamic", # Allows row deletion via the UI
+            num_rows="dynamic",
             key="history_editor",
             width="stretch"
         )
         
         if st.button("💾 Save Changes", type="primary"):
-            # 1. Handle Deletions
             original_ids = set(edit_df['id'])
             current_ids = set(edited_df['id'])
             deleted_ids = original_ids - current_ids
             
             for d_id in deleted_ids:
-                delete_run(d_id)
+                delete_run(USER_ID, d_id)
                 
-            # 2. Handle Run Type Edits
             for index, row in edited_df.iterrows():
-                # Find original row to compare
                 orig_row = edit_df[edit_df['id'] == row['id']].iloc[0]
                 if orig_row['run_type'] != row['run_type']:
-                    update_run_type(row['id'], row['run_type'])
+                    update_run_type(USER_ID, row['id'], row['run_type'])
                     
             st.success("Changes saved successfully!")
             st.rerun()
             
         st.divider()
         
-        # --- Screenshot Insight Updating ---
         st.subheader("📸 Update Historical Insights")
         st.write("Upload screenshots of lap paces/HR graphs to update the AI analysis for any previous run.")
         
@@ -904,7 +898,6 @@ with tab5:
                     st.warning("Please upload at least one screenshot.")
                 else:
                     with st.spinner("Analyzing screenshots..."):
-                        # Build pseudo context
                         pseudo_metrics = {
                             'distance': selected_run_to_enrich['distance'],
                             'duration': selected_run_to_enrich['duration'],
@@ -915,7 +908,7 @@ with tab5:
                         
                         try:
                             new_insight = generate_historical_insight(detailed_context, hist_screenshot_files, selected_run_to_enrich['date'])
-                            update_run_insight(selected_run_to_enrich['id'], new_insight)
+                            update_run_insight(USER_ID, selected_run_to_enrich['id'], new_insight)
                             st.success("Insight successfully updated!")
                             st.rerun()
                         except Exception as e:
