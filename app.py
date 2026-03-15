@@ -555,7 +555,17 @@ else:
     current_phase = "Recovery/Post-Race"
 
 # --- Tabs ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload", "📅 7-Day Plan", "🗺️ Broad Plan", "📊 History", "⚙️ Manage"])
+# Determine if the user is the superuser (Nigel)
+is_admin = st.session_state.get('username') == 'Nigel'
+
+tab_names = ["📤 Upload", "📅 7-Day Plan", "🗺️ Broad Plan", "📊 History", "⚙️ Manage"]
+if is_admin:
+    tab_names.append("🛠️ Admin DB")
+
+tabs = st.tabs(tab_names)
+tab1, tab2, tab3, tab4, tab5 = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
+if is_admin:
+    tab_admin = tabs[5]
 
 with tab1:
     st.markdown("### 1️⃣ Upload Activity Data")
@@ -916,3 +926,56 @@ with tab5:
             
     else:
         st.info("No runs available to manage.")
+
+# --- ADMIN DB MANAGEMENT TAB ---
+if is_admin:
+    with tab_admin:
+        st.header("🛠️ Database Administration")
+        st.warning("⚠️ **Warning:** You have direct backend access. Manually editing or deleting records here can break the app for users.")
+        
+        # 1. Download Database
+        if os.path.exists("coach.db"):
+            with open("coach.db", "rb") as f:
+                st.download_button(
+                    label="💾 Download SQLite Database (coach.db)", 
+                    data=f, 
+                    file_name="coach.db",
+                    mime="application/octet-stream"
+                )
+        
+        st.divider()
+        
+        # 2. Table Viewer
+        st.subheader("🔍 View Tables")
+        with sqlite3.connect('coach.db') as conn:
+            tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)['name'].tolist()
+            selected_table = st.selectbox("Select a table to view:", tables)
+            
+            if selected_table:
+                df_table = pd.read_sql_query(f"SELECT * FROM {selected_table}", conn)
+                st.dataframe(df_table, width="stretch")
+        
+        st.divider()
+        
+        # 3. Raw SQL Console
+        st.subheader("⚡ Execute Raw SQL")
+        sql_query = st.text_area("SQL Query (e.g., SELECT * FROM users, or DELETE FROM runs WHERE id = 5)", height=100)
+        
+        if st.button("Run Query", type="primary"):
+            if not sql_query.strip():
+                st.warning("Please enter a SQL query.")
+            else:
+                try:
+                    with sqlite3.connect('coach.db') as conn:
+                        # Handle SELECT queries by displaying the results
+                        if sql_query.strip().upper().startswith("SELECT"):
+                            res_df = pd.read_sql_query(sql_query, conn)
+                            st.dataframe(res_df, width="stretch")
+                        # Handle modification queries (INSERT, UPDATE, DELETE, DROP, etc.)
+                        else:
+                            c = conn.cursor()
+                            c.execute(sql_query)
+                            conn.commit()
+                            st.success(f"Query executed successfully! Rows affected: {c.rowcount}")
+                except Exception as e:
+                    st.error(f"SQL Error: {e}")
