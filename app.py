@@ -23,7 +23,7 @@ except (KeyError, FileNotFoundError):
 # ----------------------------
 
 def init_db():
-    """Initialize the SQLite database for storing run history and macro plans."""
+    """Initialize the SQLite database for storing run history, macro plans, and micro plans."""
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS runs
@@ -49,6 +49,10 @@ def init_db():
         # Table for storing the Broad Training Plan (Macrocycle)
         c.execute('''CREATE TABLE IF NOT EXISTS macro_plan
                      (id INTEGER PRIMARY KEY, plan_text TEXT)''')
+                     
+        # Table for storing the 7-Day Training Plan (Microcycle)
+        c.execute('''CREATE TABLE IF NOT EXISTS micro_plan
+                     (id INTEGER PRIMARY KEY, plan_json TEXT)''')
             
         conn.commit()
 
@@ -111,6 +115,21 @@ def save_macro_plan(plan_text):
     with sqlite3.connect('coach.db') as conn:
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO macro_plan (id, plan_text) VALUES (1, ?)", (plan_text,))
+        conn.commit()
+        
+def get_micro_plan():
+    """Retrieve the saved 7-Day Training Plan from the DB."""
+    with sqlite3.connect('coach.db') as conn:
+        df = pd.read_sql_query("SELECT plan_json FROM micro_plan WHERE id = 1", conn)
+        if not df.empty:
+            return json.loads(df['plan_json'].iloc[0])
+        return None
+
+def save_micro_plan(plan_data):
+    """Save the 7-Day Training Plan to the DB to prevent re-fetching on reload."""
+    with sqlite3.connect('coach.db') as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO micro_plan (id, plan_json) VALUES (1, ?)", (json.dumps(plan_data),))
         conn.commit()
 
 # ----------------------------
@@ -381,7 +400,7 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
 
 st.set_page_config(page_title="AI Running Coach", page_icon="🏃‍♂️", layout="wide")
 
-# Inject Custom CSS for Aesthetics (Fixed for Dark/Light Mode Compatibility)
+# Inject Custom CSS for Aesthetics
 st.markdown("""
 <style>
     /* Main Fonts */
@@ -421,6 +440,12 @@ st.markdown("""
 
 # Initialize database
 init_db()
+
+# Load the stored 7-Day Plan from DB into session state on app start
+if 'current_plan' not in st.session_state:
+    stored_plan = get_micro_plan()
+    if stored_plan:
+        st.session_state['current_plan'] = stored_plan
 
 st.title("🏃‍♂️ AI Dynamic Running Coach")
 
@@ -513,7 +538,6 @@ with tab1:
             st.markdown("### 2️⃣ Review & Categorize")
             st.info("Tag your recent runs so the AI can sequence your upcoming workouts correctly (Easy → Interval → Tempo → Long Run).")
             
-            # Cleaner interface for categorization using a container
             with st.container(border=True):
                 for i, run in enumerate(all_runs_data):
                     col1, col2 = st.columns([3, 1])
@@ -569,7 +593,10 @@ with tab1:
                             if latest_run_id and 'qualitative_insight' in coach_response:
                                 update_run_insight(latest_run_id, coach_response['qualitative_insight'])
                             
+                            # Save the new 7-Day Plan to Streamlit Session AND Database
                             st.session_state['current_plan'] = coach_response['plan']
+                            save_micro_plan(coach_response['plan'])
+                            
                             st.success("Training Plan & Insights Updated! Check the 'My Training Plan' tab.")
                         except Exception as e:
                             st.error(f"Error communicating with AI: {e}")
@@ -605,14 +632,17 @@ with tab2:
                             if 'qualitative_insight' in coach_response:
                                 update_run_insight(latest_run_row['id'], coach_response['qualitative_insight'])
                                 
+                            # Save the new 7-Day Plan to Streamlit Session AND Database
                             st.session_state['current_plan'] = coach_response['plan']
+                            save_micro_plan(coach_response['plan'])
+                            
                             st.rerun() 
                         except Exception as e:
                             st.error(f"Error communicating with AI: {e}")
     
     st.divider()
 
-    if 'current_plan' in st.session_state:
+    if 'current_plan' in st.session_state and st.session_state['current_plan']:
         plan = st.session_state['current_plan']
         
         for day in plan:
@@ -624,7 +654,7 @@ with tab2:
             
             display_date = day.get('date', f"Day {day.get('day', '?')}")
             
-            with st.expander(f"{display_date} - {icon} {day['type']} ({day['distance_km']} km)"):
+            with st.expander(f"{display_date} - {icon} {day['type']} ({day.get('distance_km', 0)} km)"):
                 if day['type'] == 'Rest':
                     st.write(day.get('workout_details', 'Rest and recover. Focus on hydration, adequate sleep, and light mobility if needed.'))
                 else:
