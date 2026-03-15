@@ -564,7 +564,7 @@ with tab1:
                     target_screenshot_run_date = run_options_for_images[selected_run_for_images]['metrics']['date']
 
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("🚀 Log Run(s) & Generate Plan", type="primary", use_container_width=True, disabled=len(available_days)==0):
+            if st.button("🚀 Log Run(s) & Generate Plan", type="primary", width="stretch", disabled=len(available_days)==0):
                 if not API_KEY:
                     st.error("API Key is missing! Please set GEMINI_API_KEY in your .streamlit/secrets.toml or environment variables.")
                 else:
@@ -608,7 +608,7 @@ with tab2:
     with col1:
         st.write(f"Here is your dynamically generated plan. It is tailored to the **{current_phase.split('(')[0].strip()}** to gradually build your fitness safely.")
     with col2:
-        if st.button("🔄 Refresh Plan", type="primary", disabled=len(available_days)==0, use_container_width=True):
+        if st.button("🔄 Refresh Plan", type="primary", disabled=len(available_days)==0, width="stretch"):
             if not API_KEY:
                 st.error("API Key is missing!")
             else:
@@ -735,7 +735,7 @@ with tab4:
         
         # Select columns to display
         display_cols = ['Date', 'Type', 'Distance (km)', 'Pace (min/sec)', 'Duration (h/min)', 'Avg HR']
-        st.dataframe(display_history_df[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(display_history_df[display_cols], width="stretch", hide_index=True)
         
         st.divider()
         
@@ -783,7 +783,7 @@ with tab4:
             ]
         ).properties(height=350)
         
-        st.altair_chart(pace_chart, use_container_width=True)
+        st.altair_chart(pace_chart, width="stretch")
         
     else:
         st.info("No runs logged yet. Upload a TCX file to start building your history.")
@@ -818,7 +818,7 @@ with tab5:
             hide_index=True,
             num_rows="dynamic", # Allows row deletion via the UI
             key="history_editor",
-            use_container_width=True
+            width="stretch"
         )
         
         if st.button("💾 Save Changes", type="primary"):
@@ -859,7 +859,7 @@ with tab5:
             hist_screenshot_files = st.file_uploader("Upload Screenshots", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="hist_upload", label_visibility="collapsed")
             
         with col_hist2:
-            if st.button("Generate Insight", type="primary", use_container_width=True):
+            if st.button("Generate Insight", type="primary", width="stretch"):
                 if not API_KEY:
                     st.error("API Key is missing!")
                 elif not hist_screenshot_files:
