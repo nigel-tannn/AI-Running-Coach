@@ -364,7 +364,7 @@ def generate_historical_insight(detailed_run_context, uploaded_images, run_date)
     response = model.generate_content(contents)
     return response.text
 
-def update_training_plan(detailed_run_context, run_history_df, user_goal, available_days, current_phase, weeks_to_race, uploaded_images=None, screenshot_run_date=None, latest_run_type="Easy"):
+def update_training_plan(detailed_run_context, run_history_df, user_goal, available_days, current_phase, weeks_to_race, uploaded_images=None, screenshot_run_date=None, latest_run_type="Easy", latest_run_date_str="Unknown"):
     genai.configure(api_key=API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
     
@@ -372,8 +372,10 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     
     sgt_now = datetime.now(timezone(timedelta(hours=8)))
     today_name = sgt_now.strftime("%A, %B %d")
+    today_date_str = sgt_now.strftime("%Y-%m-%d")
     
-    next_7_days = [(sgt_now + timedelta(days=i)).strftime("%A, %B %d") for i in range(1, 8)]
+    # Start the 7-day plan from today (day 0)
+    next_7_days = [(sgt_now + timedelta(days=i)).strftime("%A, %B %d") for i in range(0, 7)]
     next_7_days_str = ", ".join(next_7_days)
     
     all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -387,6 +389,16 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
         phase_str = f"Their current training phase is: **{current_phase}**."
     else:
         phase_str = f"They are currently {weeks_to_race:.1f} weeks away from their race day, putting them in the **{current_phase}**."
+        
+    # Correctly identify if the latest logged run happened TODAY or in the PAST
+    latest_run_was_today = latest_run_date_str.startswith(today_date_str)
+    
+    if latest_run_was_today:
+        run_timing_context = f"Here is the detailed breakdown of the run they just completed TODAY ({today_name}):\n{detailed_run_context}"
+        today_instruction = f"- The user HAS ALREADY COMPLETED a run today ({latest_run_type}). You MUST assign 'Rest / Completed' for today's plan entry ({today_name}) and schedule the next active run in the sequence for a subsequent available day."
+    else:
+        run_timing_context = f"Here is the detailed breakdown of their MOST RECENT run (completed on {latest_run_date_str}, which is NOT today):\n{detailed_run_context}"
+        today_instruction = f"- The user HAS NOT run today. Schedule the NEXT active run in the sequence starting from today ({today_name}), provided today is one of their available running days. If today is not an available day, assign 'Rest' and schedule the active run for the next available day."
     
     prompt = f"""
     You are an elite endurance running coach. The user's ultimate goal is: "{goal_str}".
@@ -395,8 +407,7 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     Here is their recent running history (last 10 runs):
     {history_str}
     
-    Here is the detailed breakdown of the run they just completed today ({today_name}):
-    {detailed_run_context}
+    {run_timing_context}
     """
     
     if uploaded_images and screenshot_run_date:
@@ -408,6 +419,7 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     
     Task 2: Generate a 7-Day Training Schedule (Microcycle)
     - The exact next 7 days are: {next_7_days_str}. Use these EXACT strings for the "date" field.
+    {today_instruction}
     - CRITICAL SCHEDULE CONSTRAINTS: 
       1. Available running days: {avail_days_str}. You MUST assign "Rest" (0 km) on {rest_days_str}.
       2. WORKOUT SEQUENCE: The ideal weekly sequence of active runs is: Easy Run -> Interval -> Tempo -> Long Run.
@@ -678,7 +690,18 @@ with tab1:
                     
                     with st.spinner("Coach AI is analyzing your splits and structuring your next block..."):
                         try:
-                            coach_response = update_training_plan(detailed_context, history_df, user_goal, available_days, current_phase, weeks_to_race, screenshot_files, target_screenshot_run_date, latest_run['run_type'])
+                            coach_response = update_training_plan(
+                                detailed_run_context=detailed_context, 
+                                run_history_df=history_df, 
+                                user_goal=user_goal, 
+                                available_days=available_days, 
+                                current_phase=current_phase, 
+                                weeks_to_race=weeks_to_race, 
+                                uploaded_images=screenshot_files, 
+                                screenshot_run_date=target_screenshot_run_date, 
+                                latest_run_type=latest_run['run_type'],
+                                latest_run_date_str=latest_run['metrics']['date']
+                            )
                             
                             if latest_run_id and 'qualitative_insight' in coach_response:
                                 update_run_insight(USER_ID, latest_run_id, coach_response['qualitative_insight'])
@@ -716,7 +739,18 @@ with tab2:
                     
                     with st.spinner("Coach AI is scaling your mileage and generating your updated schedule..."):
                         try:
-                            coach_response = update_training_plan(detailed_context, history_df, user_goal, available_days, current_phase, weeks_to_race, None, None, latest_run_row['run_type'])
+                            coach_response = update_training_plan(
+                                detailed_run_context=detailed_context, 
+                                run_history_df=history_df, 
+                                user_goal=user_goal, 
+                                available_days=available_days, 
+                                current_phase=current_phase, 
+                                weeks_to_race=weeks_to_race, 
+                                uploaded_images=None, 
+                                screenshot_run_date=None, 
+                                latest_run_type=latest_run_row['run_type'],
+                                latest_run_date_str=latest_run_row['date']
+                            )
                             
                             if 'qualitative_insight' in coach_response:
                                 update_run_insight(USER_ID, latest_run_row['id'], coach_response['qualitative_insight'])
