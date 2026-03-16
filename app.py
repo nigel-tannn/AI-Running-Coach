@@ -601,7 +601,8 @@ if is_admin:
 
 with tab1:
     st.markdown("### 1️⃣ Upload Activity Data")
-    uploaded_files = st.file_uploader("Upload Garmin TCX Files", type=['tcx'], accept_multiple_files=True, label_visibility="collapsed")
+    # Removing 'type' to bypass iOS iCloud restriction on .tcx
+    uploaded_files = st.file_uploader("Upload Garmin TCX Files", accept_multiple_files=True, label_visibility="collapsed")
     
     screenshot_files = []
     target_screenshot_run_date = None
@@ -614,7 +615,17 @@ with tab1:
         
         with st.spinner("Parsing TCX data & extracting laps..."):
             for file in uploaded_files:
-                df, laps_df = parse_tcx(file)
+                # Backend validation for file type
+                if not file.name.lower().endswith('.tcx'):
+                    st.warning(f"⚠️ Skipped '{file.name}' - Only .tcx files are supported for activity data.")
+                    continue
+                    
+                try:
+                    df, laps_df = parse_tcx(file)
+                except Exception:
+                    st.error(f"❌ Failed to parse '{file.name}'. Ensure it is a valid XML/TCX file.")
+                    continue
+                    
                 metrics = compute_metrics(df)
                 if metrics:
                     run_date = metrics['date']
@@ -774,7 +785,7 @@ with tab2:
             
             display_date = day.get('date', f"Day {day.get('day', '?')}")
             with st.expander(f"{display_date} - {icon} {day['type']} ({day.get('distance_km', 0)} km)"):
-                if day['type'] == 'Rest':
+                if day['type'] == 'Rest' or 'Completed' in day['type']:
                     st.write(day.get('workout_details', 'Rest and recover. Focus on hydration, adequate sleep, and light mobility if needed.'))
                 else:
                     st.markdown(day.get('workout_details', ''))
