@@ -3,3 +3,4 @@ pandas
 google-generativeai
 altair
 Pillow
+psycopg2-binary

@@ -2,7 +2,8 @@ import streamlit as st
 import xml.etree.ElementTree as ET
 import pandas as pd
 import google.generativeai as genai
-import sqlite3
+import psycopg2
+from contextlib import contextmanager
 import json
 from datetime import datetime, timezone, timedelta
 import os
@@ -11,12 +12,29 @@ from PIL import Image
 import hashlib
 
 # ----------------------------
-# Configure Gemini API
+# Configure APIs & Connections
 # ----------------------------
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except (KeyError, FileNotFoundError):
     API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    
+try:
+    DB_URL = st.secrets["DATABASE_URL"]
+except (KeyError, FileNotFoundError):
+    DB_URL = os.environ.get("DATABASE_URL", "")
+
+# ----------------------------
+# Database Connection Manager
+# ----------------------------
+@contextmanager
+def get_db():
+    """Safely open and close a connection to the Supabase PostgreSQL database."""
+    conn = psycopg2.connect(DB_URL)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 # ----------------------------
 # Authentication Helpers
@@ -27,121 +45,122 @@ def hash_password(password):
 
 def verify_user(username, password):
     """Verify a user's login credentials."""
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT id, password FROM users WHERE username = ?", (username,))
-        row = c.fetchone()
-        if row and row[1] == hash_password(password):
-            return row[0] # Return user_id
-        return None
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT id, password FROM users WHERE username = %s", (username,))
+            row = c.fetchone()
+            if row and row[1] == hash_password(password):
+                return row[0] # Return user_id
+            return None
 
 def create_user(username, password):
     """Create a new user account."""
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        try:
-            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hash_password(password)))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False # Username already exists
+    with get_db() as conn:
+        with conn.cursor() as c:
+            try:
+                c.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (username, hash_password(password)))
+                conn.commit()
+                return True
+            except psycopg2.IntegrityError:
+                conn.rollback()
+                return False # Username already exists
 
 # ----------------------------
 # Database Setup
 # ----------------------------
 
 def init_db():
-    """Initialize the SQLite database for the multi-tenant app."""
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        
-        # 1. Create Users Table
-        c.execute('''CREATE TABLE IF NOT EXISTS users
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                      username TEXT UNIQUE, 
-                      password TEXT)''')
-                      
-        # Ensure Default User (Nigel) exists
-        c.execute("SELECT id FROM users WHERE username = 'Nigel'")
-        if not c.fetchone():
-            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", ("Nigel", hash_password("nigel123")))
+    """Initialize the PostgreSQL database for the multi-tenant app."""
+    with get_db() as conn:
+        with conn.cursor() as c:
+            # 1. Create Users Table
+            c.execute('''CREATE TABLE IF NOT EXISTS users
+                         (id SERIAL PRIMARY KEY, 
+                          username TEXT UNIQUE, 
+                          password TEXT)''')
+                          
+            # Ensure Default User (Nigel) exists
+            c.execute("SELECT id FROM users WHERE username = 'Nigel'")
+            if not c.fetchone():
+                c.execute("INSERT INTO users (username, password) VALUES (%s, %s)", ("Nigel", hash_password("nigel123")))
 
-        # 2. Initialize Data Tables with user_id
-        c.execute('''CREATE TABLE IF NOT EXISTS runs
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                      user_id INTEGER,
-                      date TEXT, distance REAL, duration REAL, 
-                      avg_hr REAL, pace REAL, run_type TEXT, insight TEXT)''')
-                      
-        c.execute('''CREATE TABLE IF NOT EXISTS macro_plan
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_text TEXT)''')
-                     
-        c.execute('''CREATE TABLE IF NOT EXISTS micro_plan
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_json TEXT)''')
-                     
-        c.execute('''CREATE TABLE IF NOT EXISTS user_profile
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, goal TEXT, race_date TEXT, available_days TEXT)''')
+            # 2. Initialize Data Tables with user_id
+            c.execute('''CREATE TABLE IF NOT EXISTS runs
+                         (id SERIAL PRIMARY KEY, 
+                          user_id INTEGER,
+                          date TEXT, distance REAL, duration REAL, 
+                          avg_hr REAL, pace REAL, run_type TEXT, insight TEXT)''')
+                          
+            c.execute('''CREATE TABLE IF NOT EXISTS macro_plan
+                         (id SERIAL PRIMARY KEY, user_id INTEGER UNIQUE, plan_text TEXT)''')
+                         
+            c.execute('''CREATE TABLE IF NOT EXISTS micro_plan
+                         (id SERIAL PRIMARY KEY, user_id INTEGER UNIQUE, plan_json TEXT)''')
+                         
+            c.execute('''CREATE TABLE IF NOT EXISTS user_profile
+                         (id SERIAL PRIMARY KEY, user_id INTEGER UNIQUE, goal TEXT, race_date TEXT, available_days TEXT)''')
 
-        conn.commit()
+            conn.commit()
 
 # --- Profile Database Functions ---
 def get_user_profile(user_id):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT goal, race_date, available_days FROM user_profile WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        if not row:
-            # Create completely empty default profile for new users
-            c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (?, ?, ?, ?)",
-                      (user_id, "", "", "[]"))
-            conn.commit()
-            return ("", "", "[]")
-        return row
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT goal, race_date, available_days FROM user_profile WHERE user_id = %s", (user_id,))
+            row = c.fetchone()
+            if not row:
+                # Create completely empty default profile for new users
+                c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (%s, %s, %s, %s)",
+                          (user_id, "", "", "[]"))
+                conn.commit()
+                return ("", "", "[]")
+            return row
 
 def update_user_profile(user_id, goal, race_date, available_days):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        date_str = race_date.strftime("%Y-%m-%d") if race_date else ""
-        days_str = json.dumps(available_days)
-        
-        c.execute("SELECT id FROM user_profile WHERE user_id = ?", (user_id,))
-        if c.fetchone():
-            c.execute("UPDATE user_profile SET goal = ?, race_date = ?, available_days = ? WHERE user_id = ?",
-                      (goal, date_str, days_str, user_id))
-        else:
-            c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (?, ?, ?, ?)",
-                      (user_id, goal, date_str, days_str))
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            date_str = race_date.strftime("%Y-%m-%d") if race_date else ""
+            days_str = json.dumps(available_days)
+            
+            c.execute("SELECT id FROM user_profile WHERE user_id = %s", (user_id,))
+            if c.fetchone():
+                c.execute("UPDATE user_profile SET goal = %s, race_date = %s, available_days = %s WHERE user_id = %s",
+                          (goal, date_str, days_str, user_id))
+            else:
+                c.execute("INSERT INTO user_profile (user_id, goal, race_date, available_days) VALUES (%s, %s, %s, %s)",
+                          (user_id, goal, date_str, days_str))
+            conn.commit()
 
 # --- Run History Database Functions ---
 def run_exists(user_id, date):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT id FROM runs WHERE user_id = ? AND date = ?", (user_id, date))
-        return c.fetchone() is not None
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT id FROM runs WHERE user_id = %s AND date = %s", (user_id, date))
+            return c.fetchone() is not None
 
 def save_run(user_id, date, distance, duration, avg_hr, pace, run_type):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO runs (user_id, date, distance, duration, avg_hr, pace, run_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (user_id, date, distance, duration, avg_hr, pace, run_type))
-        conn.commit()
-        return c.lastrowid
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("INSERT INTO runs (user_id, date, distance, duration, avg_hr, pace, run_type) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                      (user_id, date, distance, duration, avg_hr, pace, run_type))
+            run_id = c.fetchone()[0]
+            conn.commit()
+            return run_id
 
 def update_run_insight(user_id, run_id, insight_text):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("UPDATE runs SET insight = ? WHERE id = ? AND user_id = ?", (insight_text, int(run_id), user_id))
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE runs SET insight = %s WHERE id = %s AND user_id = %s", (insight_text, int(run_id), user_id))
+            conn.commit()
 
 def update_run_type(user_id, run_id, new_run_type):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("UPDATE runs SET run_type = ? WHERE id = ? AND user_id = ?", (new_run_type, int(run_id), user_id))
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE runs SET run_type = %s WHERE id = %s AND user_id = %s", (new_run_type, int(run_id), user_id))
+            conn.commit()
 
 def get_run_history(user_id, limit=None):
-    with sqlite3.connect('coach.db') as conn:
+    with get_db() as conn:
         query = f"SELECT id, date, distance, duration, avg_hr, pace, run_type, insight FROM runs WHERE user_id = {user_id} ORDER BY date DESC"
         if limit:
             query += f" LIMIT {limit}"
@@ -149,45 +168,45 @@ def get_run_history(user_id, limit=None):
     return df
 
 def delete_run(user_id, run_id):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM runs WHERE id = ? AND user_id = ?", (int(run_id), user_id))
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM runs WHERE id = %s AND user_id = %s", (int(run_id), user_id))
+            conn.commit()
 
 # --- Plan Database Functions ---
 def get_macro_plan(user_id):
-    with sqlite3.connect('coach.db') as conn:
+    with get_db() as conn:
         df = pd.read_sql_query(f"SELECT plan_text FROM macro_plan WHERE user_id = {user_id}", conn)
         if not df.empty:
             return df['plan_text'].iloc[0]
         return None
 
 def save_macro_plan(user_id, plan_text):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT id FROM macro_plan WHERE user_id = ?", (user_id,))
-        if c.fetchone():
-            c.execute("UPDATE macro_plan SET plan_text = ? WHERE user_id = ?", (plan_text, user_id))
-        else:
-            c.execute("INSERT INTO macro_plan (user_id, plan_text) VALUES (?, ?)", (user_id, plan_text))
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT id FROM macro_plan WHERE user_id = %s", (user_id,))
+            if c.fetchone():
+                c.execute("UPDATE macro_plan SET plan_text = %s WHERE user_id = %s", (plan_text, user_id))
+            else:
+                c.execute("INSERT INTO macro_plan (user_id, plan_text) VALUES (%s, %s)", (user_id, plan_text))
+            conn.commit()
         
 def get_micro_plan(user_id):
-    with sqlite3.connect('coach.db') as conn:
+    with get_db() as conn:
         df = pd.read_sql_query(f"SELECT plan_json FROM micro_plan WHERE user_id = {user_id}", conn)
         if not df.empty:
             return json.loads(df['plan_json'].iloc[0])
         return None
 
 def save_micro_plan(user_id, plan_data):
-    with sqlite3.connect('coach.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT id FROM micro_plan WHERE user_id = ?", (user_id,))
-        if c.fetchone():
-            c.execute("UPDATE micro_plan SET plan_json = ? WHERE user_id = ?", (json.dumps(plan_data), user_id))
-        else:
-            c.execute("INSERT INTO micro_plan (user_id, plan_json) VALUES (?, ?)", (user_id, json.dumps(plan_data)))
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT id FROM micro_plan WHERE user_id = %s", (user_id,))
+            if c.fetchone():
+                c.execute("UPDATE micro_plan SET plan_json = %s WHERE user_id = %s", (json.dumps(plan_data), user_id))
+            else:
+                c.execute("INSERT INTO micro_plan (user_id, plan_json) VALUES (%s, %s)", (user_id, json.dumps(plan_data)))
+            conn.commit()
 
 # ----------------------------
 # Helper Functions
@@ -273,12 +292,13 @@ def compute_metrics(df):
     pace = duration_mins / distance if distance > 0 else 0
     start_time = df["time"].iloc[0]
     
+    # Cast numpy.float64 to standard Python floats for PostgreSQL compatibility
     return {
         "date": start_time.strftime("%Y-%m-%d %H:%M"),
-        "distance": round(distance, 2),
-        "duration": round(duration_mins, 2),
-        "avg_hr": round(avg_hr, 1),
-        "pace": round(pace, 2),
+        "distance": float(round(distance, 2)),
+        "duration": float(round(duration_mins, 2)),
+        "avg_hr": float(round(avg_hr, 1)),
+        "pace": float(round(pace, 2)),
         "formatted_pace": format_pace(pace)
     }
 
@@ -480,8 +500,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize database
-init_db()
+# Try initializing database, fail gracefully if credentials aren't set up yet
+if DB_URL:
+    try:
+        init_db()
+    except Exception as e:
+        st.error(f"Failed to connect to the database: {e}")
+        st.stop()
+else:
+    st.error("DATABASE_URL is missing from Streamlit Secrets.")
+    st.stop()
 
 # --- AUTHENTICATION LAYER ---
 if 'user_id' not in st.session_state:
@@ -1001,22 +1029,10 @@ if is_admin:
         st.header("🛠️ Database Administration")
         st.warning("⚠️ **Warning:** You have direct backend access. Manually editing or deleting records here can break the app for users.")
         
-        # 1. Download Database
-        if os.path.exists("coach.db"):
-            with open("coach.db", "rb") as f:
-                st.download_button(
-                    label="💾 Download SQLite Database (coach.db)", 
-                    data=f, 
-                    file_name="coach.db",
-                    mime="application/octet-stream"
-                )
-        
-        st.divider()
-        
-        # 2. Table Viewer
+        # Table Viewer
         st.subheader("🔍 View Tables")
-        with sqlite3.connect('coach.db') as conn:
-            tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)['name'].tolist()
+        with get_db() as conn:
+            tables = pd.read_sql_query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';", conn)['table_name'].tolist()
             selected_table = st.selectbox("Select a table to view:", tables)
             
             if selected_table:
@@ -1025,7 +1041,7 @@ if is_admin:
         
         st.divider()
         
-        # 3. Raw SQL Console
+        # Raw SQL Console
         st.subheader("⚡ Execute Raw SQL")
         sql_query = st.text_area("SQL Query (e.g., SELECT * FROM users, or DELETE FROM runs WHERE id = 5)", height=100)
         
@@ -1034,16 +1050,16 @@ if is_admin:
                 st.warning("Please enter a SQL query.")
             else:
                 try:
-                    with sqlite3.connect('coach.db') as conn:
+                    with get_db() as conn:
                         # Handle SELECT queries by displaying the results
                         if sql_query.strip().upper().startswith("SELECT"):
                             res_df = pd.read_sql_query(sql_query, conn)
                             st.dataframe(res_df, width="stretch")
                         # Handle modification queries (INSERT, UPDATE, DELETE, DROP, etc.)
                         else:
-                            c = conn.cursor()
-                            c.execute(sql_query)
-                            conn.commit()
-                            st.success(f"Query executed successfully! Rows affected: {c.rowcount}")
+                            with conn.cursor() as c:
+                                c.execute(sql_query)
+                                conn.commit()
+                                st.success(f"Query executed successfully! Rows affected: {c.rowcount}")
                 except Exception as e:
                     st.error(f"SQL Error: {e}")
