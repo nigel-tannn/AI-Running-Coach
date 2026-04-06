@@ -384,7 +384,7 @@ def generate_historical_insight(detailed_run_context, uploaded_images, run_date)
     response = model.generate_content(contents)
     return response.text
 
-def update_training_plan(detailed_run_context, run_history_df, user_goal, available_days, current_phase, weeks_to_race, uploaded_images=None, screenshot_run_date=None, latest_run_type="Easy", latest_run_date_str="Unknown"):
+def update_training_plan(detailed_run_context, run_history_df, user_goal, available_days, current_phase, weeks_to_race, uploaded_images=None, screenshot_run_date=None, latest_run_type="Easy", latest_run_date_str="Unknown", macro_plan_text=None):
     genai.configure(api_key=API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
     
@@ -410,6 +410,10 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     else:
         phase_str = f"They are currently {weeks_to_race:.1f} weeks away from their race day, putting them in the **{current_phase}**."
         
+    macro_context = ""
+    if macro_plan_text:
+        macro_context = f"\n--- MACROCYCLE PLAN ---\nThe user has the following long-term training plan explicitly saved:\n{macro_plan_text}\n-----------------------\n"
+
     # Correctly identify if the latest logged run happened TODAY or in the PAST
     latest_run_was_today = latest_run_date_str.startswith(today_date_str)
     
@@ -423,6 +427,7 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     prompt = f"""
     You are an elite endurance running coach. The user's ultimate goal is: "{goal_str}".
     {phase_str}
+    {macro_context}
     
     Here is their recent running history (last 10 runs):
     {history_str}
@@ -442,8 +447,11 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     {today_instruction}
     - CRITICAL SCHEDULE CONSTRAINTS: 
       1. Available running days: {avail_days_str}. You MUST assign "Rest" (0 km) on {rest_days_str}.
-      2. WORKOUT SEQUENCE: The ideal weekly sequence of active runs is: Easy Run -> Interval -> Tempo -> Long Run.
-         The user's most recent run was: **{latest_run_type}**. Sequence the NEXT active day based on this cycle.
+      2. WORKOUT SELECTION & SEQUENCE: Do NOT stick to a rigid round-robin schedule. Tailor the workout types (Easy, Interval, Tempo, Long Run, Speedwork, etc.) directly to the user's specific goal: "{goal_str}". 
+         - If a Macrocycle Plan is provided above, ensure this 7-day microcycle strictly aligns with the goals and intensity of the current phase in that plan.
+         - For short/fast goals (e.g., 2.4km, 5k), prioritize speedwork, VO2 max intervals, and targeted pacing.
+         - For endurance goals (e.g., Half/Full Marathon), prioritize aerobic base building, progressive long runs, and threshold tempos.
+         - The user's most recent run was: **{latest_run_type}**. Ensure appropriate recovery (Easy runs or Rest) after hard efforts. Do not stack back-to-back hard sessions.
       3. PROGRESSIVE OVERLOAD & OVERTRAINING PREVENTION: Look at their recent historical distances. Do NOT increase total weekly mileage by more than 10-15%. Prioritize recovery if their HR data indicates fatigue. Scale the intensity appropriately.
       4. EXTREMELY DETAILED GUIDANCE: For active runs, provide highly detailed Markdown guidance (`workout_details`). Must include headers for: Goal, Warm-up, Main Set (reps, exact segment pace targets), Cool-down, and Execution Cues.
     
@@ -576,15 +584,25 @@ db_race_date = datetime.strptime(db_race_date_str, "%Y-%m-%d").date() if db_race
 db_avail_days = json.loads(db_avail_days_str) if db_avail_days_str else []
 
 st.sidebar.header("🎯 Goal & Timeline")
-user_goal = st.sidebar.text_area("What is your running goal?", value=db_goal, placeholder="e.g. Run a Sub-50 min 10k")
-race_date = st.sidebar.date_input("Race Date", value=db_race_date)
 
-st.sidebar.subheader("🗓️ Availability")
-available_days = st.sidebar.multiselect(
-    "Select your available running days:",
-    ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
-    default=db_avail_days
-)
+# Using a form to avoid UI buffering/lag on multi-select interactions
+with st.sidebar.form("profile_form"):
+    user_goal = st.text_area("What is your running goal?", value=db_goal, placeholder="e.g. Run a Sub-50 min 10k")
+    race_date = st.date_input("Race Date", value=db_race_date)
+
+    st.subheader("🗓️ Availability")
+    available_days = st.multiselect(
+        "Select your available running days:",
+        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+        default=db_avail_days
+    )
+    
+    save_profile = st.form_submit_button("💾 Save Settings")
+
+if save_profile:
+    update_user_profile(USER_ID, user_goal, race_date, available_days)
+    st.sidebar.success("Profile saved!")
+    st.rerun()
 
 if not user_goal:
     st.sidebar.warning("Please set a running goal.")
@@ -592,10 +610,6 @@ if not race_date:
     st.sidebar.warning("Please set a target race date.")
 if not available_days:
     st.sidebar.warning("Please select at least one available running day.")
-
-# Auto-save changes to the profile
-if user_goal != db_goal or race_date != db_race_date or available_days != db_avail_days:
-    update_user_profile(USER_ID, user_goal, race_date, available_days)
 
 # Calculate Training Phase based on weeks to race
 if race_date:
@@ -726,6 +740,7 @@ with tab1:
                     history_df = get_run_history(USER_ID, limit=15)
                     latest_run = all_runs_data[0] 
                     detailed_context = generate_detailed_context(latest_run['metrics'], latest_run['laps_df'], latest_run['run_type'])
+                    saved_macro = get_macro_plan(USER_ID)
                     
                     with st.spinner("Coach AI is analyzing your splits and structuring your next block..."):
                         try:
@@ -739,7 +754,8 @@ with tab1:
                                 uploaded_images=screenshot_files, 
                                 screenshot_run_date=target_screenshot_run_date, 
                                 latest_run_type=latest_run['run_type'],
-                                latest_run_date_str=latest_run['metrics']['date']
+                                latest_run_date_str=latest_run['metrics']['date'],
+                                macro_plan_text=saved_macro
                             )
                             
                             if latest_run_id and 'qualitative_insight' in coach_response:
@@ -775,6 +791,7 @@ with tab2:
                         'formatted_pace': format_pace(latest_run_row['pace'])
                     }
                     detailed_context = generate_detailed_context(pseudo_metrics, pd.DataFrame(), latest_run_row['run_type'])
+                    saved_macro = get_macro_plan(USER_ID)
                     
                     with st.spinner("Coach AI is scaling your mileage and generating your updated schedule..."):
                         try:
@@ -788,7 +805,8 @@ with tab2:
                                 uploaded_images=None, 
                                 screenshot_run_date=None, 
                                 latest_run_type=latest_run_row['run_type'],
-                                latest_run_date_str=latest_run_row['date']
+                                latest_run_date_str=latest_run_row['date'],
+                                macro_plan_text=saved_macro
                             )
                             
                             if 'qualitative_insight' in coach_response:
@@ -831,7 +849,7 @@ with tab3:
     
     st.write("Generate a week-by-week overview of your entire training block leading up to race day to understand how your mileage and intensity will gradually ramp up safely.")
     
-    if st.button("🗺️ Generate Broad Plan", type="primary"):
+    if st.button("🗺️ Generate AI Broad Plan", type="primary"):
         if not API_KEY:
             st.error("API Key is missing!")
         else:
@@ -847,10 +865,15 @@ with tab3:
                     
     st.divider()
     saved_macro_plan = get_macro_plan(USER_ID)
-    if saved_macro_plan:
-        st.markdown(saved_macro_plan)
-    else:
-        st.info("No Broad Plan generated yet. Click the button above to create one.")
+    
+    st.subheader("📝 View & Edit Broad Plan")
+    st.info("You can manually update your broad training plan below without regenerating the whole plan. Changes here will guide the AI when it creates your weekly 7-day schedule.")
+    
+    with st.form("macro_plan_form"):
+        edited_macro_plan = st.text_area("Macro Plan Content", value=saved_macro_plan if saved_macro_plan else "", height=400)
+        if st.form_submit_button("💾 Save Broad Plan"):
+            save_macro_plan(USER_ID, edited_macro_plan)
+            st.success("Broad plan updated successfully!")
 
 with tab4:
     st.header("📊 Run History & Insights")
