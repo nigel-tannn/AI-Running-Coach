@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import xml.etree.ElementTree as ET
 import pandas as pd
 import google.generativeai as genai
@@ -394,8 +395,12 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     today_name = sgt_now.strftime("%A, %B %d")
     today_date_str = sgt_now.strftime("%Y-%m-%d")
     
-    # Start the 7-day plan from today (day 0)
-    next_7_days = [(sgt_now + timedelta(days=i)).strftime("%A, %B %d") for i in range(0, 7)]
+    # Correctly identify if the latest logged run happened TODAY or in the PAST
+    latest_run_was_today = latest_run_date_str.startswith(today_date_str)
+    
+    # Intelligently shift the 7-day projection to start TOMORROW if they already ran today.
+    start_offset = 1 if latest_run_was_today else 0
+    next_7_days = [(sgt_now + timedelta(days=i)).strftime("%A, %B %d") for i in range(start_offset, start_offset + 7)]
     next_7_days_str = ", ".join(next_7_days)
     
     all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -413,16 +418,13 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
     macro_context = ""
     if macro_plan_text:
         macro_context = f"\n--- MACROCYCLE PLAN ---\nThe user has the following long-term training plan explicitly saved:\n{macro_plan_text}\n-----------------------\n"
-
-    # Correctly identify if the latest logged run happened TODAY or in the PAST
-    latest_run_was_today = latest_run_date_str.startswith(today_date_str)
     
     if latest_run_was_today:
         run_timing_context = f"Here is the detailed breakdown of the run they just completed TODAY ({today_name}):\n{detailed_run_context}"
-        today_instruction = f"- The user HAS ALREADY COMPLETED a run today ({latest_run_type}). You MUST assign 'Rest / Completed' for today's plan entry ({today_name}) and schedule the next active run in the sequence for a subsequent available day."
+        today_instruction = f"- The user HAS ALREADY COMPLETED their run for today ({latest_run_type}). The 7-day schedule MUST start from TOMORROW ({next_7_days[0]})."
     else:
         run_timing_context = f"Here is the detailed breakdown of their MOST RECENT run (completed on {latest_run_date_str}, which is NOT today):\n{detailed_run_context}"
-        today_instruction = f"- The user HAS NOT run today. Schedule the NEXT active run in the sequence starting from today ({today_name}), provided today is one of their available running days. If today is not an available day, assign 'Rest' and schedule the active run for the next available day."
+        today_instruction = f"- The user HAS NOT run today. Schedule the NEXT active run in the sequence starting from today ({today_name}), provided today is one of their available running days. If today is not an available day, assign 'Rest'."
     
     prompt = f"""
     You are an elite endurance running coach. The user's ultimate goal is: "{goal_str}".
@@ -440,19 +442,20 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
 
     prompt += f"""
     Task 1: Generate a Qualitative Insight
-    Provide a detailed, qualitative analysis of the latest run. Discuss pacing consistency, heart rate drift, effort levels, and recovery. 
+    Provide a detailed, qualitative analysis of the latest run. Discuss pacing consistency, heart rate drift, effort levels, and recovery. Take the user's qualitative feedback into heavy consideration.
     
     Task 2: Generate a 7-Day Training Schedule (Microcycle)
     - The exact next 7 days are: {next_7_days_str}. Use these EXACT strings for the "date" field.
     {today_instruction}
     - CRITICAL SCHEDULE CONSTRAINTS: 
       1. Available running days: {avail_days_str}. You MUST assign "Rest" (0 km) on {rest_days_str}.
-      2. WORKOUT SELECTION & SEQUENCE: Do NOT stick to a rigid round-robin schedule. Tailor the workout types (Easy, Interval, Tempo, Long Run, Speedwork, etc.) directly to the user's specific goal: "{goal_str}". 
+      2. WORKOUT SELECTION, SEQUENCE & VARIETY: Do NOT stick to a rigid round-robin schedule. Tailor the workout types directly to the user's specific goal: "{goal_str}". 
          - If a Macrocycle Plan is provided above, ensure this 7-day microcycle strictly aligns with the goals and intensity of the current phase in that plan.
          - For short/fast goals (e.g., 2.4km, 5k), prioritize speedwork, VO2 max intervals, and targeted pacing.
          - For endurance goals (e.g., Half/Full Marathon), prioritize aerobic base building, progressive long runs, and threshold tempos.
+         - **CRUCIAL VARIETY REQUIREMENT**: Introduce HIGH VARIETY in speedwork/intervals. Do not merely repeat standard 400m/800m intervals. Intelligently mix in Fartleks, Hill Sprints, Descending Ladders (e.g., 1000m/800m/600m/400m), Pyramid intervals, and varying recovery times. Keep the training stimulus engaging and target different energy systems.
          - The user's most recent run was: **{latest_run_type}**. Ensure appropriate recovery (Easy runs or Rest) after hard efforts. Do not stack back-to-back hard sessions.
-      3. PROGRESSIVE OVERLOAD & OVERTRAINING PREVENTION: Look at their recent historical distances. Do NOT increase total weekly mileage by more than 10-15%. Prioritize recovery if their HR data indicates fatigue. Scale the intensity appropriately.
+      3. PROGRESSIVE OVERLOAD & OVERTRAINING PREVENTION: Look at their recent historical distances. Do NOT increase total weekly mileage by more than 10-15%. Prioritize recovery if their HR data or qualitative feedback indicates fatigue. Scale the intensity appropriately.
       4. EXTREMELY DETAILED GUIDANCE: For active runs, provide highly detailed Markdown guidance (`workout_details`). Must include headers for: Goal, Warm-up, Main Set (reps, exact segment pace targets), Cool-down, and Execution Cues.
     
     Respond ONLY with a valid JSON object matching this exact schema:
@@ -460,10 +463,10 @@ def update_training_plan(detailed_run_context, run_history_df, user_goal, availa
       "qualitative_insight": "Your detailed, qualitative analysis paragraph...",
       "plan": [
         {{
-          "date": "Monday, March 16",
-          "type": "Interval",
+          "date": "Tuesday, March 17",
+          "type": "Descending Ladder Interval",
           "distance_km": 7,
-          "workout_details": "### Goal\\nImprove VO2max.\\n\\n### Warm-up\\n- 2 km easy (6:30-6:50/km)\\n- HR < 150\\n\\n### Main Set\\n- 6 x 400m\\n- **Target pace:** 4:15-4:20/km\\n- **Recovery:** 90 sec easy jog\\n\\n### Cool-down\\n- 1.5 km easy (6:30-6:50/km)\\n\\n### Key Execution Cues\\n- Quick cadence (~180 spm)"
+          "workout_details": "### Goal\\nImprove VO2max & Lactate Clearance.\\n\\n### Warm-up\\n- 2 km easy (6:30-6:50/km)\\n- HR < 150\\n\\n### Main Set\\n- 1200m, 800m, 400m, 200m descending ladder...\\n- **Target pace:** progressively faster...\\n- **Recovery:** 90 sec easy jog...\\n\\n### Cool-down\\n- 1.5 km easy (6:30-6:50/km)\\n\\n### Key Execution Cues\\n- Quick cadence (~180 spm)"
         }}
       ]
     }}
@@ -648,6 +651,7 @@ with tab1:
     
     screenshot_files = []
     target_screenshot_run_date = None
+    user_comments = ""
     
     if uploaded_files:
         all_runs_data = []
@@ -697,7 +701,7 @@ with tab1:
             st.success(f"✅ {len(all_runs_data)} new run(s) parsed successfully!")
             
             st.markdown("### 2️⃣ Review & Categorize")
-            st.info("Tag your recent runs so the AI can sequence your upcoming workouts correctly (Easy → Interval → Tempo → Long Run).")
+            st.info("Tag your recent runs so the AI can sequence your upcoming workouts correctly.")
             
             with st.container(border=True):
                 for i, run in enumerate(all_runs_data):
@@ -715,7 +719,8 @@ with tab1:
                         st.divider()
             
             st.markdown("### 3️⃣ Enrich Insights (Optional)")
-            with st.expander("📸 Attach Lap Paces / HR Charts"):
+            with st.expander("📸 Attach Lap Paces / HR Charts & Comments"):
+                user_comments = st.text_area("How did the run feel? (Optional: effort, fatigue, weather, soreness)", placeholder="e.g., Felt heavy in the legs during the last 2km...")
                 st.write("Upload screenshots from Garmin Connect or Coros to give the AI deeper visual context.")
                 screenshot_files = st.file_uploader("Upload Screenshots", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, label_visibility="collapsed")
                 
@@ -740,6 +745,11 @@ with tab1:
                     history_df = get_run_history(USER_ID, limit=15)
                     latest_run = all_runs_data[0] 
                     detailed_context = generate_detailed_context(latest_run['metrics'], latest_run['laps_df'], latest_run['run_type'])
+                    
+                    # Inject User Qualitative feedback
+                    if user_comments:
+                        detailed_context += f"\nUser's Qualitative Feedback: {user_comments}\n"
+                        
                     saved_macro = get_macro_plan(USER_ID)
                     
                     with st.spinner("Coach AI is analyzing your splits and structuring your next block..."):
@@ -764,7 +774,21 @@ with tab1:
                             st.session_state['current_plan'] = coach_response['plan']
                             save_micro_plan(USER_ID, coach_response['plan'])
                             
-                            st.success("Training Plan & Insights Updated! Check the 'My Training Plan' tab.")
+                            st.success("Training Plan & Insights Updated! Redirecting to your plan...")
+                            
+                            # Trigger Auto-Redirect Javascript
+                            components.html(
+                                """
+                                <script>
+                                const tabs = window.parent.document.querySelectorAll('button[data-baseweb="tab"]');
+                                if (tabs.length > 1) {
+                                    tabs[1].click();
+                                }
+                                </script>
+                                """,
+                                height=0, width=0
+                            )
+
                         except Exception as e:
                             st.error(f"Error communicating with AI: {e}")
 
@@ -825,7 +849,7 @@ with tab2:
         for day in plan:
             icon = "🏃"
             if "Rest" in day['type']: icon = "🛋️"
-            elif "Interval" in day['type']: icon = "⚡"
+            elif "Interval" in day['type'] or "Fartlek" in day['type'] or "Ladder" in day['type'] or "Sprint" in day['type']: icon = "⚡"
             elif "Tempo" in day['type']: icon = "🔥"
             elif "Long" in day['type']: icon = "🗺️"
             
@@ -1017,16 +1041,19 @@ with tab5:
                 key="enrich_select",
                 label_visibility="collapsed"
             )
+            
+            # Allow user comments for historical insights as well
+            hist_user_comments = st.text_area("Update Comments:", placeholder="Add any qualitative context about this run...", key="hist_comments")
             hist_screenshot_files = st.file_uploader("Upload Screenshots", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="hist_upload", label_visibility="collapsed")
             
         with col_hist2:
             if st.button("Generate Insight", type="primary", width="stretch"):
                 if not API_KEY:
                     st.error("API Key is missing!")
-                elif not hist_screenshot_files:
-                    st.warning("Please upload at least one screenshot.")
+                elif not hist_screenshot_files and not hist_user_comments:
+                    st.warning("Please upload screenshots or provide text context to generate a new insight.")
                 else:
-                    with st.spinner("Analyzing screenshots..."):
+                    with st.spinner("Analyzing run context..."):
                         pseudo_metrics = {
                             'distance': selected_run_to_enrich['distance'],
                             'duration': selected_run_to_enrich['duration'],
@@ -1034,6 +1061,9 @@ with tab5:
                             'formatted_pace': format_pace(selected_run_to_enrich['pace'])
                         }
                         detailed_context = generate_detailed_context(pseudo_metrics, pd.DataFrame(), selected_run_to_enrich['run_type'])
+                        
+                        if hist_user_comments:
+                            detailed_context += f"\nUser's Qualitative Feedback: {hist_user_comments}\n"
                         
                         try:
                             new_insight = generate_historical_insight(detailed_context, hist_screenshot_files, selected_run_to_enrich['date'])
